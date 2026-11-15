@@ -2870,7 +2870,194 @@ impl RenderMaterialBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render_resource::{BindingNumber, BindlessIndexTableDescriptor};
+    use crate::{
+        render_resource::{
+            binding_types::uniform_buffer_sized, BindGroupLayoutEntries, BindingNumber,
+            BindlessIndexTableDescriptor, ShaderStages,
+        },
+        test_utils::create_dummy_device,
+    };
+    use core::num::NonZero;
+
+    /// Everything needed to prepare non-bindless bind groups in a test.
+    struct NonBindlessTestContext {
+        render_device: RenderDevice,
+        render_queue: RenderQueue,
+        pipeline_cache: PipelineCache,
+        fallback_buffer: FallbackBuffer,
+        layout: BindGroupLayoutDescriptor,
+        allocator: MaterialBindGroupAllocator,
+    }
+
+    impl NonBindlessTestContext {
+        /// Creates an allocator for a material that has two 16-byte POD
+        /// bindings, on the noop backend.
+        fn new() -> Self {
+            let (render_device, render_queue) = create_dummy_device();
+            let fallback_buffer = FallbackBuffer(render_device.create_buffer(&BufferDescriptor {
+                label: None,
+                size: 16,
+                usage: BufferUsages::UNIFORM,
+                mapped_at_creation: false,
+            }));
+            Self {
+                pipeline_cache: PipelineCache::new(render_device.clone(), true),
+                render_device,
+                render_queue,
+                fallback_buffer,
+                layout: BindGroupLayoutDescriptor::new(
+                    "test material layout",
+                    &BindGroupLayoutEntries::sequential(
+                        ShaderStages::FRAGMENT,
+                        (
+                            uniform_buffer_sized(false, NonZero::new(16)),
+                            uniform_buffer_sized(false, NonZero::new(16)),
+                        ),
+                    ),
+                ),
+                allocator: MaterialBindGroupAllocator::NonBindless(Box::new(
+                    MaterialBindGroupNonBindlessAllocator::new("test material"),
+                )),
+            }
+        }
+
+        /// What the renderer does once a frame after preparing materials.
+        fn prepare_and_write(&mut self) {
+            let MaterialBindGroupAllocator::NonBindless(ref mut allocator) = self.allocator else {
+                unreachable!()
+            };
+            allocator.prepare_bind_groups(
+                &self.render_device,
+                &self.pipeline_cache,
+                &self.fallback_buffer,
+                &RenderAssets::<GpuShaderBuffer>::default(),
+                &RenderChangedShaderBuffers::default(),
+            );
+            self.allocator
+                .write_buffers(&self.render_device, &self.render_queue);
+        }
+
+        /// The IDs of the uniform buffers of a prepared bind group.
+        fn uniform_buffer_ids(&self, binding_id: MaterialBindingId) -> Vec<BufferId> {
+            let MaterialBindGroupAllocator::NonBindless(ref allocator) = self.allocator else {
+                unreachable!()
+            };
+            match allocator.bind_groups[*binding_id.group as usize] {
+                Some(MaterialNonBindlessAllocatedBindGroup::Prepared {
+                    ref uniform_buffers,
+                    ..
+                }) => uniform_buffers.iter().map(Buffer::id).collect(),
+                _ => panic!("the bind group should be prepared"),
+            }
+        }
+    }
+
+    /// Builds the bind group of a material that has two POD bindings.
+    fn build_two_uniform_material(builder: &mut BindGroupBuilder, a: [u8; 16], b: [u8; 16]) {
+        builder.clear();
+        builder.data_buffer.extend_from_slice(&a);
+        builder.data_buffer.extend_from_slice(&b);
+        builder
+            .binding_resources
+            .push((0, UnpreparedBindingResource::Data(0..16)));
+        builder
+            .binding_resources
+            .push((1, UnpreparedBindingResource::Data(16..32)));
+    }
+
+    /// Changing only the uniform data of a non-bindless material must not
+    /// allocate new GPU buffers.
+    ///
+    /// This mirrors what `RenderMaterialBindings::prepare_material` does each
+    /// time a material asset changes: try the fast path, and fall back to
+    /// freeing and reallocating the material.
+    #[test]
+    fn non_bindless_data_only_change_reuses_uniform_buffers() {
+        const CHANGES: usize = 1000;
+
+        let mut context = NonBindlessTestContext::new();
+        let mut builder = BindGroupBuilder::default();
+        build_two_uniform_material(&mut builder, [0; 16], [0; 16]);
+        let mut binding_id = context
+            .allocator
+            .allocate_unprepared(&mut builder, &context.layout);
+        context.prepare_and_write();
+        let original_buffers = context.uniform_buffer_ids(binding_id);
+        assert_eq!(original_buffers.len(), 2);
+
+        let mut fast_path_hits = 0;
+        let mut uniform_buffers_created = 0;
+        for change in 1..=CHANGES {
+            let before = context.uniform_buffer_ids(binding_id);
+            build_two_uniform_material(&mut builder, [change as u8; 16], [!(change as u8); 16]);
+            if context.allocator.try_update_data(binding_id, &mut builder) {
+                fast_path_hits += 1;
+            } else {
+                context.allocator.free(binding_id);
+                binding_id = context
+                    .allocator
+                    .allocate_unprepared(&mut builder, &context.layout);
+            }
+            context.prepare_and_write();
+            let after = context.uniform_buffer_ids(binding_id);
+            uniform_buffers_created += after.iter().filter(|id| !before.contains(id)).count();
+        }
+
+        // Shown with `cargo test -- --nocapture`.
+        println!(
+            "{CHANGES} data-only changes: {fast_path_hits} took the fast path, \
+             {uniform_buffers_created} uniform buffers created"
+        );
+        assert_eq!(fast_path_hits, CHANGES);
+        assert_eq!(uniform_buffers_created, 0);
+        assert_eq!(context.uniform_buffer_ids(binding_id), original_buffers);
+    }
+
+    /// The fast path must refuse a bind group that hasn't been prepared yet, a
+    /// material whose GPU resources changed, and a material whose data changed
+    /// size.
+    #[test]
+    fn non_bindless_fast_path_rejects_resource_changes() {
+        let mut context = NonBindlessTestContext::new();
+        let mut builder = BindGroupBuilder::default();
+        build_two_uniform_material(&mut builder, [0; 16], [0; 16]);
+        let binding_id = context
+            .allocator
+            .allocate_unprepared(&mut builder, &context.layout);
+
+        // Not prepared yet.
+        build_two_uniform_material(&mut builder, [1; 16], [1; 16]);
+        assert!(!context.allocator.try_update_data(binding_id, &mut builder));
+
+        context.prepare_and_write();
+
+        // A POD binding became a buffer of its own.
+        builder.clear();
+        builder.data_buffer.extend_from_slice(&[2; 16]);
+        builder
+            .binding_resources
+            .push((0, UnpreparedBindingResource::Data(0..16)));
+        builder.binding_resources.push((
+            1,
+            UnpreparedBindingResource::Buffer((*context.fallback_buffer).clone()),
+        ));
+        assert!(!context.allocator.try_update_data(binding_id, &mut builder));
+
+        // The data changed size.
+        builder.clear();
+        builder.data_buffer.extend_from_slice(&[3; 48]);
+        builder
+            .binding_resources
+            .push((0, UnpreparedBindingResource::Data(0..16)));
+        builder
+            .binding_resources
+            .push((1, UnpreparedBindingResource::Data(16..48)));
+        assert!(!context.allocator.try_update_data(binding_id, &mut builder));
+
+        // Nothing but the data changed.
+        build_two_uniform_material(&mut builder, [4; 16], [4; 16]);
+        assert!(context.allocator.try_update_data(binding_id, &mut builder));
+    }
 
     #[test]
     fn get_bindless_index_table() {
