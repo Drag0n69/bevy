@@ -20,7 +20,7 @@ use core::hash::Hash;
 use core::{cmp::Ordering, iter, mem, ops::Range};
 use std::any::TypeId;
 use tracing::{error, trace};
-
+mod gripforge_fast; // GripForge (MOT-133): the POD of a non-bindless material rewritten in place.
 use crate::{
     erased_render_asset::PrepareAssetError,
     render_asset::RenderAssets,
@@ -234,6 +234,8 @@ pub struct MaterialBindGroupNonBindlessAllocator {
     to_prepare: HashSet<MaterialBindGroupIndex>,
     /// A list of free bind group indices.
     free_indices: Vec<MaterialBindGroupIndex>,
+    /// GripForge (MOT-133): uniform buffers rewritten in place, written by `write_buffers` (`gripforge_fast.rs`).
+    pending_writes: Vec<(Buffer, Vec<u8>)>,
 }
 
 /// A single bind group that a [`MaterialBindGroupNonBindlessAllocator`] is
@@ -262,7 +264,6 @@ enum MaterialNonBindlessAllocatedBindGroup {
         /// invalid.
         layout: BindGroupLayoutDescriptor,
         /// Uniform buffers referenced by the bind group.
-        #[expect(dead_code, reason = "These buffers are only referenced by bind groups")]
         uniform_buffers: Vec<Buffer>,
     },
 }
@@ -679,10 +680,8 @@ impl MaterialBindGroupAllocator {
                 ref mut material_bind_group_bindless_allocator,
             ) => material_bind_group_bindless_allocator
                 .try_update_data(existing_binding_id, unprepared_bind_group),
-            MaterialBindGroupAllocator::NonBindless(_) => {
-                // TODO: Have a fast path for non-bindless materials.
-                false
-            }
+            MaterialBindGroupAllocator::NonBindless(ref mut allocator) => allocator
+                .try_update_data(existing_binding_id, unprepared_bind_group),
         }
     }
 
@@ -731,9 +730,7 @@ impl MaterialBindGroupAllocator {
             MaterialBindGroupAllocator::Bindless(
                 ref mut material_bind_group_bindless_allocator,
             ) => material_bind_group_bindless_allocator.write_buffers(render_device, render_queue),
-            MaterialBindGroupAllocator::NonBindless(_) => {
-                // Not applicable.
-            }
+            MaterialBindGroupAllocator::NonBindless(ref mut allocator) => allocator.write_pending(render_queue),
         }
     }
 
@@ -2373,6 +2370,7 @@ impl MaterialBindGroupNonBindlessAllocator {
             bind_groups: vec![],
             to_prepare: HashSet::default(),
             free_indices: vec![],
+            pending_writes: vec![],
         }
     }
 
