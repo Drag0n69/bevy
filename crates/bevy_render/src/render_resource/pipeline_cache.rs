@@ -876,8 +876,31 @@ impl PipelineCache {
             }
         }
 
-        for id in waiting_pipelines {
-            self.process_pipeline(&mut pipelines[id], id);
+        // GripForge (native/vendor/README.md): on the web a pipeline is made on the thread of the page (a GL program
+        // compiled and linked: 50 to 150 ms on WebGL2). Past the budget the ones still to start wait for the next
+        // frame, oldest first, instead of one frame making them all (the start of the engine made 28 in one go).
+        let budget = creation_budget();
+        if budget.is_none() {
+            for id in waiting_pipelines {
+                self.process_pipeline(&mut pipelines[id], id);
+            }
+        } else {
+            let mut ids: Vec<CachedPipelineId> = waiting_pipelines.into_iter().collect();
+            ids.sort_unstable();
+            let started = bevy_platform::time::Instant::now();
+            let mut over = false;
+            for id in ids {
+                if over && matches!(pipelines[id].state, CachedPipelineState::Queued) {
+                    // Not started: kept for the next frame.
+                    self.waiting_pipelines.insert(id);
+                    continue;
+                }
+                let was_queued = matches!(pipelines[id].state, CachedPipelineState::Queued);
+                self.process_pipeline(&mut pipelines[id], id);
+                if was_queued && budget.is_some_and(|b| started.elapsed() >= b) {
+                    over = true;
+                }
+            }
         }
 
         self.pipelines = pipelines;
@@ -1087,4 +1110,33 @@ fn create_pipeline_task(
         Ok(pipeline) => CachedPipelineState::Ok(pipeline),
         Err(err) => CachedPipelineState::Err(err),
     }
+}
+
+/// The time one `process_queue` may spend starting pipelines, in microseconds (0: no limit, the published behaviour).
+/// Set by the player on the web (`set_creation_budget_us`).
+static CREATION_BUDGET_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Limits the time a frame spends starting pipelines (the one that crosses the limit finishes; the rest wait for the
+/// next frame). 0 turns the limit off. Only the web build keeps it (elsewhere pipelines are made on other threads).
+pub fn set_creation_budget_us(us: u32) {
+    CREATION_BUDGET_US.store(us, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Pipelines started or finished this frame are not the only ones: those still waiting to start (`Queued`) and
+/// those being made. Read by the player to know the scene is complete.
+pub fn pending_pipelines(cache: &PipelineCache) -> usize {
+    cache.waiting_pipelines.len() + cache.new_pipelines.lock().map(|n| n.len()).unwrap_or(0)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn creation_budget() -> Option<core::time::Duration> {
+    match CREATION_BUDGET_US.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        us => Some(core::time::Duration::from_micros(us as u64)),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn creation_budget() -> Option<core::time::Duration> {
+    None
 }
