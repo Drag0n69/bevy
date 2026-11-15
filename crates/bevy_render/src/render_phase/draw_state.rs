@@ -140,10 +140,16 @@ impl<'a> TrackedRenderPass<'a> {
         let limits = device.limits();
         let max_bind_groups = limits.max_bind_groups as usize;
         let max_vertex_buffers = limits.max_vertex_buffers as usize;
+        // Avoid macOS 26's allocator abort when `vec![None; n]` initializes this
+        // niche-optimized tuple. See rust-lang/rust#150898. Allocating first and
+        // constructing each element preserves empty slots without cloning the
+        // undefined payload of None (`resize(count, None)` still does that).
+        let mut vertex_buffers = Vec::with_capacity(max_vertex_buffers);
+        vertex_buffers.resize_with(max_vertex_buffers, || None);
         Self {
             state: DrawState {
                 bind_groups: vec![(None, Vec::new()); max_bind_groups],
-                vertex_buffers: vec![None; max_vertex_buffers],
+                vertex_buffers,
                 ..default()
             },
             pass,
