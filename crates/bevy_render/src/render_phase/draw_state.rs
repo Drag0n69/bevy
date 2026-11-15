@@ -140,10 +140,16 @@ impl<'a> TrackedRenderPass<'a> {
         let limits = device.limits();
         let max_bind_groups = limits.max_bind_groups as usize;
         let max_vertex_buffers = limits.max_vertex_buffers as usize;
+        // `vec![None; n]` makes the system allocator of macOS 26.0 to 26.3
+        // abort on arm64 when this vector is freed, as the elements are
+        // niche-optimized tuples that start with a `NonZero`. Construct each
+        // element instead. See rust-lang/rust issue 150898.
+        let mut vertex_buffers = Vec::with_capacity(max_vertex_buffers);
+        vertex_buffers.resize_with(max_vertex_buffers, || None);
         Self {
             state: DrawState {
                 bind_groups: vec![(None, Vec::new()); max_bind_groups],
-                vertex_buffers: vec![None; max_vertex_buffers],
+                vertex_buffers,
                 ..default()
             },
             pass,
