@@ -739,10 +739,14 @@ impl ActiveAnimation {
     }
 }
 
+/// GripForge: skip target evaluation while the animation clock continues to advance.
+/// Controlled by the host's visibility budget (vendor/README.md).
+#[derive(Component, Default, Clone, Copy, Debug)]
+pub struct SkipEvaluation(pub bool);
+
 /// Animation controls.
 ///
-/// Automatically added to any root animations of a scene when it is
-/// spawned.
+/// Automatically added to any root animations of a scene when it is spawned.
 #[derive(Component, Default, Reflect)]
 #[reflect(Component, Default, Clone)]
 pub struct AnimationPlayer {
@@ -1090,6 +1094,7 @@ pub type AnimationEntityMut<'w, 's> = EntityMutExcept<
         AnimatedBy,
         AnimationPlayer,
         AnimationGraphHandle,
+        SkipEvaluation,
     ),
 >;
 
@@ -1100,7 +1105,7 @@ pub fn animate_targets(
     clips: Res<Assets<AnimationClip>>,
     graphs: Res<Assets<AnimationGraph>>,
     threaded_animation_graphs: Res<ThreadedAnimationGraphs>,
-    players: Query<(&AnimationPlayer, &AnimationGraphHandle)>,
+    players: Query<(&AnimationPlayer, &AnimationGraphHandle, Option<&SkipEvaluation>)>,
     mut targets: Query<
         (Entity, &AnimationTargetId, &AnimatedBy, AnimationEntityMut),
         Without<IsResource>,
@@ -1112,7 +1117,8 @@ pub fn animate_targets(
         .par_iter_mut()
         .for_each(|(entity, &target_id, &AnimatedBy(player_id), entity_mut)| {
             let (animation_player, animation_graph_id) =
-                if let Ok((player, graph_handle)) = players.get(player_id) {
+                if let Ok((player, graph_handle, skip)) = players.get(player_id) {
+                    if skip.is_some_and(|s| s.0) { return; }
                     (player, graph_handle.id())
                 } else {
                     trace!(
