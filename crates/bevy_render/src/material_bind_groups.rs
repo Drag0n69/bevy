@@ -234,6 +234,11 @@ pub struct MaterialBindGroupNonBindlessAllocator {
     to_prepare: HashSet<MaterialBindGroupIndex>,
     /// A list of free bind group indices.
     free_indices: Vec<MaterialBindGroupIndex>,
+    /// Uniform buffers whose contents were replaced by
+    /// [`Self::try_update_data`], along with the new contents.
+    ///
+    /// These are uploaded to the GPU in [`Self::write_buffers`].
+    pending_uniform_writes: Vec<(Buffer, Vec<u8>)>,
 }
 
 /// A single bind group that a [`MaterialBindGroupNonBindlessAllocator`] is
@@ -261,8 +266,8 @@ enum MaterialNonBindlessAllocatedBindGroup {
         /// happen if a shader buffer changes, causing the bind group to become
         /// invalid.
         layout: BindGroupLayoutDescriptor,
-        /// Uniform buffers referenced by the bind group.
-        #[expect(dead_code, reason = "These buffers are only referenced by bind groups")]
+        /// Uniform buffers referenced by the bind group, one for each
+        /// [`OwnedBindingResource::Data`] binding, in binding order.
         uniform_buffers: Vec<Buffer>,
     },
 }
@@ -679,10 +684,10 @@ impl MaterialBindGroupAllocator {
                 ref mut material_bind_group_bindless_allocator,
             ) => material_bind_group_bindless_allocator
                 .try_update_data(existing_binding_id, unprepared_bind_group),
-            MaterialBindGroupAllocator::NonBindless(_) => {
-                // TODO: Have a fast path for non-bindless materials.
-                false
-            }
+            MaterialBindGroupAllocator::NonBindless(
+                ref mut material_bind_group_non_bindless_allocator,
+            ) => material_bind_group_non_bindless_allocator
+                .try_update_data(existing_binding_id, unprepared_bind_group),
         }
     }
 
@@ -724,16 +729,16 @@ impl MaterialBindGroupAllocator {
     /// Uploads the contents of all buffers that this
     /// [`MaterialBindGroupAllocator`] manages to the GPU.
     ///
-    /// Non-bindless allocators don't currently manage any buffers, so this
-    /// method only has an effect for bindless allocators.
+    /// For non-bindless allocators, this uploads the uniform data of the
+    /// materials that [`Self::try_update_data`] updated in place.
     pub fn write_buffers(&mut self, render_device: &RenderDevice, render_queue: &RenderQueue) {
         match *self {
             MaterialBindGroupAllocator::Bindless(
                 ref mut material_bind_group_bindless_allocator,
             ) => material_bind_group_bindless_allocator.write_buffers(render_device, render_queue),
-            MaterialBindGroupAllocator::NonBindless(_) => {
-                // Not applicable.
-            }
+            MaterialBindGroupAllocator::NonBindless(
+                ref mut material_bind_group_non_bindless_allocator,
+            ) => material_bind_group_non_bindless_allocator.write_buffers(render_queue),
         }
     }
 
@@ -2364,6 +2369,37 @@ fn init_fallback_resources(mut commands: Commands, render_device: Res<RenderDevi
     )));
 }
 
+/// Returns true if a binding of an already-prepared non-bindless bind group
+/// and a binding of a new material refer to the same GPU resource.
+///
+/// Plain old data is considered unchanged if its size is the same, as its
+/// contents can be rewritten in place.
+fn non_bindless_resource_is_unchanged(
+    old_resource: &OwnedBindingResource,
+    new_resource: &UnpreparedBindingResource,
+) -> bool {
+    match (old_resource, new_resource) {
+        (OwnedBindingResource::Buffer(old), UnpreparedBindingResource::Buffer(new)) => {
+            old.id() == new.id()
+        }
+        (OwnedBindingResource::ShaderBuffer(old), UnpreparedBindingResource::ShaderBuffer(new)) => {
+            old.id() == new.id()
+        }
+        (
+            OwnedBindingResource::TextureView(old_dimension, old),
+            UnpreparedBindingResource::TextureView(new_dimension, new),
+        ) => old_dimension == new_dimension && old.id() == new.id(),
+        (
+            OwnedBindingResource::Sampler(old_type, old),
+            UnpreparedBindingResource::Sampler(new_type, new),
+        ) => old_type == new_type && old.id() == new.id(),
+        (OwnedBindingResource::Data(old), UnpreparedBindingResource::Data(new_range)) => {
+            old.len() == (new_range.end - new_range.start) as usize
+        }
+        _ => false,
+    }
+}
+
 impl MaterialBindGroupNonBindlessAllocator {
     /// Creates a new [`MaterialBindGroupNonBindlessAllocator`] managing the
     /// bind groups for a single non-bindless material.
@@ -2373,6 +2409,7 @@ impl MaterialBindGroupNonBindlessAllocator {
             bind_groups: vec![],
             to_prepare: HashSet::default(),
             free_indices: vec![],
+            pending_uniform_writes: vec![],
         }
     }
 
@@ -2438,6 +2475,100 @@ impl MaterialBindGroupNonBindlessAllocator {
             layout: bind_group_layout,
             uniform_buffers: vec![],
         })
+    }
+
+    /// Attempts to replace the material with the given binding ID with a new
+    /// material, without actually reallocating any GPU resources.
+    ///
+    /// This succeeds if the bind group has already been prepared and the new
+    /// material binds exactly the same buffers, textures, and samplers, with
+    /// plain old data of the same size. In that case, the new data is copied
+    /// into the uniform buffers that the bind group already references; the
+    /// upload itself happens in [`Self::write_buffers`].
+    ///
+    /// See [`MaterialBindGroupAllocator::try_update_data`] for more
+    /// information.
+    fn try_update_data(
+        &mut self,
+        binding_id: MaterialBindingId,
+        unprepared_bind_group: &mut BindGroupBuilder,
+    ) -> bool {
+        let Some(Some(MaterialNonBindlessAllocatedBindGroup::Prepared {
+            bind_group,
+            uniform_buffers,
+            ..
+        })) = self.bind_groups.get_mut(*binding_id.group as usize)
+        else {
+            // The bind group hasn't been prepared yet. Take the slow path.
+            return false;
+        };
+
+        // If the GPU resources have changed, bail. The caller will need to
+        // explicitly deallocate and reallocate the bind group.
+        let new_resources = &unprepared_bind_group.binding_resources;
+        if bind_group.bindings.len() != new_resources.len()
+            || !bind_group.bindings.iter().zip(new_resources.iter()).all(
+                |((old_index, old_resource), (new_index, new_resource))| {
+                    old_index == new_index
+                        && non_bindless_resource_is_unchanged(old_resource, new_resource)
+                },
+            )
+        {
+            return false;
+        }
+
+        // Bind groups that materials prepare themselves
+        // (`AsBindGroup::as_bind_group`) own no uniform buffers.
+        let data_binding_count = bind_group
+            .bindings
+            .iter()
+            .filter(|(_, resource)| matches!(resource, OwnedBindingResource::Data(_)))
+            .count();
+        if data_binding_count != uniform_buffers.len() {
+            return false;
+        }
+
+        // Only the POD changed. Copy it into the existing uniform buffers.
+        let mut uniform_buffers_iter = uniform_buffers.iter();
+        for ((_, old_resource), (_, new_resource)) in
+            bind_group.bindings.iter_mut().zip(new_resources.iter())
+        {
+            let (
+                OwnedBindingResource::Data(old_data),
+                UnpreparedBindingResource::Data(new_data_range),
+            ) = (old_resource, new_resource)
+            else {
+                continue;
+            };
+            let uniform_buffer = uniform_buffers_iter
+                .next()
+                .expect("We should have created uniform buffers for each `Data`");
+            let new_data = &unprepared_bind_group.data_buffer
+                [(new_data_range.start as usize)..(new_data_range.end as usize)];
+            if old_data.as_slice() == new_data {
+                continue;
+            }
+
+            // Keep the CPU-side copy up to date: it's what gets uploaded if
+            // the bind group is ever demoted to an unprepared one.
+            old_data.copy_from_slice(new_data);
+
+            // Only the last write to a buffer matters.
+            self.pending_uniform_writes
+                .retain(|(buffer, _)| buffer.id() != uniform_buffer.id());
+            self.pending_uniform_writes
+                .push((uniform_buffer.clone(), new_data.to_vec()));
+        }
+
+        true
+    }
+
+    /// Uploads the uniform data that [`Self::try_update_data`] replaced to the
+    /// GPU.
+    fn write_buffers(&mut self, render_queue: &RenderQueue) {
+        for (uniform_buffer, data) in self.pending_uniform_writes.drain(..) {
+            render_queue.write_buffer(&uniform_buffer, 0, &data);
+        }
     }
 
     /// Deallocates the bind group with the given binding ID.
@@ -2719,9 +2850,6 @@ pub fn prepare_material_bind_groups(
 
 /// Uploads the contents of all buffers that the [`MaterialBindGroupAllocator`]
 /// manages to the GPU.
-///
-/// Non-bindless allocators don't currently manage any buffers, so this method
-/// only has an effect for bindless allocators.
 pub fn write_material_bind_group_buffers(
     mut allocators: ResMut<MaterialBindGroupAllocators>,
     render_device: Res<RenderDevice>,
@@ -2870,7 +2998,194 @@ impl RenderMaterialBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render_resource::{BindingNumber, BindlessIndexTableDescriptor};
+    use crate::{
+        render_resource::{
+            binding_types::uniform_buffer_sized, BindGroupLayoutEntries, BindingNumber,
+            BindlessIndexTableDescriptor, ShaderStages,
+        },
+        test_utils::create_dummy_device,
+    };
+    use core::num::NonZero;
+
+    /// Everything needed to prepare non-bindless bind groups in a test.
+    struct NonBindlessTestContext {
+        render_device: RenderDevice,
+        render_queue: RenderQueue,
+        pipeline_cache: PipelineCache,
+        fallback_buffer: FallbackBuffer,
+        layout: BindGroupLayoutDescriptor,
+        allocator: MaterialBindGroupAllocator,
+    }
+
+    impl NonBindlessTestContext {
+        /// Creates an allocator for a material that has two 16-byte POD
+        /// bindings, on the noop backend.
+        fn new() -> Self {
+            let (render_device, render_queue) = create_dummy_device();
+            let fallback_buffer = FallbackBuffer(render_device.create_buffer(&BufferDescriptor {
+                label: None,
+                size: 16,
+                usage: BufferUsages::UNIFORM,
+                mapped_at_creation: false,
+            }));
+            Self {
+                pipeline_cache: PipelineCache::new(render_device.clone(), true),
+                render_device,
+                render_queue,
+                fallback_buffer,
+                layout: BindGroupLayoutDescriptor::new(
+                    "test material layout",
+                    &BindGroupLayoutEntries::sequential(
+                        ShaderStages::FRAGMENT,
+                        (
+                            uniform_buffer_sized(false, NonZero::new(16)),
+                            uniform_buffer_sized(false, NonZero::new(16)),
+                        ),
+                    ),
+                ),
+                allocator: MaterialBindGroupAllocator::NonBindless(Box::new(
+                    MaterialBindGroupNonBindlessAllocator::new("test material"),
+                )),
+            }
+        }
+
+        /// What the renderer does once a frame after preparing materials.
+        fn prepare_and_write(&mut self) {
+            let MaterialBindGroupAllocator::NonBindless(ref mut allocator) = self.allocator else {
+                unreachable!()
+            };
+            allocator.prepare_bind_groups(
+                &self.render_device,
+                &self.pipeline_cache,
+                &self.fallback_buffer,
+                &RenderAssets::<GpuShaderBuffer>::default(),
+                &RenderChangedShaderBuffers::default(),
+            );
+            self.allocator
+                .write_buffers(&self.render_device, &self.render_queue);
+        }
+
+        /// The IDs of the uniform buffers of a prepared bind group.
+        fn uniform_buffer_ids(&self, binding_id: MaterialBindingId) -> Vec<BufferId> {
+            let MaterialBindGroupAllocator::NonBindless(ref allocator) = self.allocator else {
+                unreachable!()
+            };
+            match allocator.bind_groups[*binding_id.group as usize] {
+                Some(MaterialNonBindlessAllocatedBindGroup::Prepared {
+                    ref uniform_buffers,
+                    ..
+                }) => uniform_buffers.iter().map(Buffer::id).collect(),
+                _ => panic!("the bind group should be prepared"),
+            }
+        }
+    }
+
+    /// Builds the bind group of a material that has two POD bindings.
+    fn build_two_uniform_material(builder: &mut BindGroupBuilder, a: [u8; 16], b: [u8; 16]) {
+        builder.clear();
+        builder.data_buffer.extend_from_slice(&a);
+        builder.data_buffer.extend_from_slice(&b);
+        builder
+            .binding_resources
+            .push((0, UnpreparedBindingResource::Data(0..16)));
+        builder
+            .binding_resources
+            .push((1, UnpreparedBindingResource::Data(16..32)));
+    }
+
+    /// Changing only the uniform data of a non-bindless material must not
+    /// allocate new GPU buffers.
+    ///
+    /// This mirrors what `RenderMaterialBindings::prepare_material` does each
+    /// time a material asset changes: try the fast path, and fall back to
+    /// freeing and reallocating the material.
+    #[test]
+    fn non_bindless_data_only_change_reuses_uniform_buffers() {
+        const CHANGES: usize = 1000;
+
+        let mut context = NonBindlessTestContext::new();
+        let mut builder = BindGroupBuilder::default();
+        build_two_uniform_material(&mut builder, [0; 16], [0; 16]);
+        let mut binding_id = context
+            .allocator
+            .allocate_unprepared(&mut builder, &context.layout);
+        context.prepare_and_write();
+        let original_buffers = context.uniform_buffer_ids(binding_id);
+        assert_eq!(original_buffers.len(), 2);
+
+        let mut fast_path_hits = 0;
+        let mut uniform_buffers_created = 0;
+        for change in 1..=CHANGES {
+            let before = context.uniform_buffer_ids(binding_id);
+            build_two_uniform_material(&mut builder, [change as u8; 16], [!(change as u8); 16]);
+            if context.allocator.try_update_data(binding_id, &mut builder) {
+                fast_path_hits += 1;
+            } else {
+                context.allocator.free(binding_id);
+                binding_id = context
+                    .allocator
+                    .allocate_unprepared(&mut builder, &context.layout);
+            }
+            context.prepare_and_write();
+            let after = context.uniform_buffer_ids(binding_id);
+            uniform_buffers_created += after.iter().filter(|id| !before.contains(id)).count();
+        }
+
+        // Shown with `cargo test -- --nocapture`.
+        println!(
+            "{CHANGES} data-only changes: {fast_path_hits} took the fast path, \
+             {uniform_buffers_created} uniform buffers created"
+        );
+        assert_eq!(fast_path_hits, CHANGES);
+        assert_eq!(uniform_buffers_created, 0);
+        assert_eq!(context.uniform_buffer_ids(binding_id), original_buffers);
+    }
+
+    /// The fast path must refuse a bind group that hasn't been prepared yet, a
+    /// material whose GPU resources changed, and a material whose data changed
+    /// size.
+    #[test]
+    fn non_bindless_fast_path_rejects_resource_changes() {
+        let mut context = NonBindlessTestContext::new();
+        let mut builder = BindGroupBuilder::default();
+        build_two_uniform_material(&mut builder, [0; 16], [0; 16]);
+        let binding_id = context
+            .allocator
+            .allocate_unprepared(&mut builder, &context.layout);
+
+        // Not prepared yet.
+        build_two_uniform_material(&mut builder, [1; 16], [1; 16]);
+        assert!(!context.allocator.try_update_data(binding_id, &mut builder));
+
+        context.prepare_and_write();
+
+        // A POD binding became a buffer of its own.
+        builder.clear();
+        builder.data_buffer.extend_from_slice(&[2; 16]);
+        builder
+            .binding_resources
+            .push((0, UnpreparedBindingResource::Data(0..16)));
+        builder.binding_resources.push((
+            1,
+            UnpreparedBindingResource::Buffer((*context.fallback_buffer).clone()),
+        ));
+        assert!(!context.allocator.try_update_data(binding_id, &mut builder));
+
+        // The data changed size.
+        builder.clear();
+        builder.data_buffer.extend_from_slice(&[3; 48]);
+        builder
+            .binding_resources
+            .push((0, UnpreparedBindingResource::Data(0..16)));
+        builder
+            .binding_resources
+            .push((1, UnpreparedBindingResource::Data(16..48)));
+        assert!(!context.allocator.try_update_data(binding_id, &mut builder));
+
+        // Nothing but the data changed.
+        build_two_uniform_material(&mut builder, [4; 16], [4; 16]);
+        assert!(context.allocator.try_update_data(binding_id, &mut builder));
+    }
 
     #[test]
     fn get_bindless_index_table() {
